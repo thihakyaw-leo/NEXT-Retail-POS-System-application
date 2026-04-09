@@ -1,0 +1,36 @@
+{
+  "name": "retail-pos-enterprise",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "dev": "npm run db:migrate:local && vite dev",
+    "build": "vite build",
+    "preview": "vite preview",
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "test": "npm run test:unit && npm run test:e2e",
+    "test:unit": "vitest run",
+    "test:e2e": "playwright test",
+    "deploy": "vite build && wrangler deploy",
+    "types:cf": "wrangler types ./src/worker-configuration.d.ts",
+    "db:migrate:local": "wrangler d1 migrations apply DB --local --persist-to .wrangler/state --config wrangler.toml"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0",
+    "@sveltejs/adapter-cloudflare": "^7.2.6",
+    "@sveltejs/kit": "^2.22.0",
+    "@sveltejs/vite-plugin-svelte": "^6.1.2",
+    "@types/node": "^24.6.0",
+    "@cloudflare/workers-types": "^4.20251002.0",
+    "playwright": "^1.55.0",
+    "svelte": "^5.39.3",
+    "svelte-check": "^4.3.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.7",
+    "vitest": "^3.2.4",
+    "wrangler": "^4.13.2"
+  }
+}
