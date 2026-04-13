@@ -1,9 +1,0 @@
-node_modules
-.svelte-kit
-.wrangler
-build
-coverage
-playwright-report
-test-results
-package-lock.json
-dev-server.log
