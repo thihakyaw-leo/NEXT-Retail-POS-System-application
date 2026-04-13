@@ -4,9 +4,19 @@ main = ".svelte-kit/cloudflare/_worker.js"
 compatibility_date = "2026-04-09"
 compatibility_flags = ["nodejs_compat"]
 
+[vars]
+JWT_SECRET = "dev-next-pos-jwt-secret"
+EMAIL_TRANSPORT = "mock"
+LOW_STOCK_REPORT_FROM = "alerts@retail-pos.example"
+LOW_STOCK_REPORT_TO = "ops@retail-pos.example"
+RESEND_API_BASE_URL = "https://api.resend.com"
+
 [assets]
 directory = ".svelte-kit/cloudflare"
 binding = "ASSETS"
+
+[triggers]
+crons = ["0 */6 * * *"]
 
 [observability]
 enabled = true

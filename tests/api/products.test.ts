@@ -4,6 +4,8 @@ import { GET as getProductImage } from '../../src/routes/api/product-images/[...
 import { POST as uploadProductImage } from '../../src/routes/api/products/[productId]/image/+server';
 import type { ProductsResponse } from '../../src/lib/types';
 import {
+	createAuthHeaders,
+	createAuthLocals,
 	createPlatform,
 	createRequestEvent,
 	createTestBindings
@@ -15,10 +17,14 @@ describe('GET /api/products', () => {
 
 		try {
 			const platform = createPlatform(context.env);
+			const headers = await createAuthHeaders(context.env, 'cashier@nextpos.test', 'Cashier#123');
+			const locals = await createAuthLocals(context.env, 'cashier@nextpos.test', 'Cashier#123');
 			const response = await getProducts(
 				createRequestEvent({
 					platform,
-					url: 'http://localhost/api/products?page=1&pageSize=2&search=milk'
+					url: 'http://localhost/api/products?page=1&pageSize=2&search=milk',
+					headers,
+					locals
 				}) as Parameters<typeof getProducts>[0]
 			);
 
@@ -40,6 +46,8 @@ describe('POST /api/products/:productId/image', () => {
 
 		try {
 			const platform = createPlatform(context.env);
+			const headers = await createAuthHeaders(context.env, 'manager@nextpos.test', 'Manager#123');
+			const locals = await createAuthLocals(context.env, 'manager@nextpos.test', 'Manager#123');
 			const formData = new FormData();
 			formData.set(
 				'image',
@@ -54,6 +62,8 @@ describe('POST /api/products/:productId/image', () => {
 					method: 'POST',
 					url: 'http://localhost/api/products/prod-arabica-1kg/image',
 					formData,
+					headers,
+					locals,
 					params: {
 						productId: 'prod-arabica-1kg'
 					}
@@ -73,6 +83,8 @@ describe('POST /api/products/:productId/image', () => {
 				createRequestEvent({
 					platform,
 					url: `http://localhost${payload.product.imageUrl}`,
+					headers,
+					locals,
 					params: {
 						key: payload.product.imageKey
 					}

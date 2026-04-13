@@ -1,1 +1,7 @@
 .vs/
+.wrangler
+.svelte-kit
+test-results
+test-results-inventory
+artifacts
+dev-server-g.log

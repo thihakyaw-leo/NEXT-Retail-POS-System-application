@@ -1,5 +1,10 @@
 import type { D1PreparedStatement } from '$lib/server/cloudflare';
 import type {
+	OfflineSaleSubmission,
+	OfflineSyncAccepted,
+	OfflineSyncRejected,
+	OfflineSyncRequest,
+	OfflineSyncResponse,
 	PaginationMeta,
 	ProductSummary,
 	ProductsResponse,
@@ -25,6 +30,7 @@ type ProductRow = {
 	description: string | null;
 	price_cents: number;
 	stock_quantity: number;
+	reorder_point: number;
 	image_key: string | null;
 };
 
@@ -35,7 +41,7 @@ type StoreRow = {
 	currency_code: string;
 };
 
-class PosHttpError extends Error {
+export class PosHttpError extends Error {
 	status: number;
 
 	constructor(status: number, message: string) {
@@ -93,21 +99,23 @@ export async function listProducts(
 	const searchFilter = search ? `%${escapeLikeValue(search)}%` : null;
 
 	const whereClause = search
-		? `WHERE store_id = ?
-			AND is_active = 1
+		? `WHERE ss.store_id = ?
+			AND p.is_active = 1
 			AND (
-				name LIKE ? ESCAPE '\\' COLLATE NOCASE
-				OR barcode LIKE ? ESCAPE '\\'
+				p.name LIKE ? ESCAPE '\\' COLLATE NOCASE
+				OR p.barcode LIKE ? ESCAPE '\\'
 			)`
-		: `WHERE store_id = ?
-			AND is_active = 1`;
+		: `WHERE ss.store_id = ?
+			AND p.is_active = 1`;
 	const parameters = search ? [storeId, searchFilter, searchFilter] : [storeId];
 
 	const totalItems =
 		Number(
 			await env.DB.prepare(
 				`SELECT COUNT(*) AS total
-				FROM products
+				FROM products p
+				INNER JOIN store_stock ss
+					ON ss.product_id = p.id
 				${whereClause}`
 			)
 				.bind(...parameters)
@@ -116,17 +124,20 @@ export async function listProducts(
 
 	const itemsResult = await env.DB.prepare(
 		`SELECT
-			id,
-			store_id,
-			name,
-			barcode,
-			description,
-			price_cents,
-			stock_quantity,
-			image_key
-		FROM products
+			p.id,
+			ss.store_id,
+			p.name,
+			p.barcode,
+			p.description,
+			p.price_cents,
+			ss.stock_quantity,
+			ss.reorder_point,
+			p.image_key
+		FROM products p
+		INNER JOIN store_stock ss
+			ON ss.product_id = p.id
 		${whereClause}
-		ORDER BY name COLLATE NOCASE ASC
+		ORDER BY p.name COLLATE NOCASE ASC
 		LIMIT ? OFFSET ?`
 	)
 		.bind(...parameters, pageSize, offset)
@@ -156,6 +167,10 @@ export async function createSale(env: PosBindings, payload: SaleRequest): Promis
 		throw new PosHttpError(400, 'At least one cart item is required.');
 	}
 
+	if (!payload.userId) {
+		throw new PosHttpError(400, 'A user ID is required for the sale.');
+	}
+
 	if (!Number.isInteger(payload.cashReceivedCents) || payload.cashReceivedCents < 0) {
 		throw new PosHttpError(400, 'Cash received must be a positive cent value.');
 	}
@@ -166,16 +181,19 @@ export async function createSale(env: PosBindings, payload: SaleRequest): Promis
 	const productResult = await session
 		.prepare(
 			`SELECT
-				id,
-				store_id,
-				name,
-				barcode,
-				description,
-				price_cents,
-				stock_quantity,
-				image_key
-			FROM products
-			WHERE store_id = ? AND id IN (${placeholders})`
+				p.id,
+				ss.store_id,
+				p.name,
+				p.barcode,
+				p.description,
+				p.price_cents,
+				ss.stock_quantity,
+				ss.reorder_point,
+				p.image_key
+			FROM products p
+			INNER JOIN store_stock ss
+				ON ss.product_id = p.id
+			WHERE ss.store_id = ? AND p.id IN (${placeholders})`
 		)
 		.bind(store.id, ...productIds)
 		.all<ProductRow>();
@@ -221,6 +239,7 @@ export async function createSale(env: PosBindings, payload: SaleRequest): Promis
 				`INSERT INTO transactions (
 					id,
 					store_id,
+					user_id,
 					receipt_number,
 					status,
 					item_count,
@@ -229,11 +248,12 @@ export async function createSale(env: PosBindings, payload: SaleRequest): Promis
 					cash_received_cents,
 					change_due_cents,
 					created_at
-				) VALUES (?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?)`
+				) VALUES (?, ?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?)`
 			)
 			.bind(
 				transactionId,
 				store.id,
+				payload.userId,
 				receiptNumber,
 				receiptItems.reduce((count, item) => count + item.quantity, 0),
 				subtotalCents,
@@ -248,11 +268,11 @@ export async function createSale(env: PosBindings, payload: SaleRequest): Promis
 		statements.push(
 			session
 				.prepare(
-					`UPDATE products
+					`UPDATE store_stock
 					SET stock_quantity = stock_quantity - ?, updated_at = ?
-					WHERE id = ?`
+					WHERE store_id = ? AND product_id = ?`
 				)
-				.bind(item.quantity, createdAt, item.productId)
+				.bind(item.quantity, createdAt, store.id, item.productId)
 		);
 	}
 
@@ -323,6 +343,290 @@ export async function createSale(env: PosBindings, payload: SaleRequest): Promis
 	};
 }
 
+export async function syncOfflineSales(
+	env: PosBindings,
+	payload: OfflineSyncRequest
+): Promise<OfflineSyncResponse> {
+	const sales = payload.sales ?? [];
+
+	if (sales.length === 0) {
+		return {
+			accepted: [],
+			rejected: [],
+			updatedProducts: []
+		};
+	}
+
+	const session = env.DB.withSession('first-primary');
+	const uniqueStoreIds = Array.from(new Set(sales.map((sale) => sale.storeId || DEFAULT_STORE_ID)));
+	const uniqueProductIds = Array.from(
+		new Set(sales.flatMap((sale) => sale.items.map((item) => item.productId)))
+	);
+
+	const storesPlaceholders = uniqueStoreIds.map(() => '?').join(', ');
+	const productsPlaceholders = uniqueProductIds.map(() => '?').join(', ');
+
+	const storesResult = await session
+		.prepare(
+			`SELECT id, name, address, currency_code
+			FROM stores
+			WHERE id IN (${storesPlaceholders})`
+		)
+		.bind(...uniqueStoreIds)
+		.all<StoreRow>();
+	const productsResult =
+		uniqueProductIds.length > 0
+			? await session
+					.prepare(
+						`SELECT
+							p.id,
+							ss.store_id,
+							p.name,
+							p.barcode,
+							p.description,
+							p.price_cents,
+							ss.stock_quantity,
+							ss.reorder_point,
+							p.image_key
+						FROM products p
+						INNER JOIN store_stock ss
+							ON ss.product_id = p.id
+						WHERE ss.store_id IN (${storesPlaceholders})
+							AND p.id IN (${productsPlaceholders})`
+					)
+					.bind(...uniqueStoreIds, ...uniqueProductIds)
+					.all<ProductRow>()
+			: {
+					results: []
+				};
+
+	const storesById = new Map(storesResult.results.map((store) => [store.id, store]));
+	const productsById = new Map(
+		productsResult.results.map((product) => [`${product.store_id}:${product.id}`, product])
+	);
+	const virtualStock = new Map(
+		productsResult.results.map((product) => [`${product.store_id}:${product.id}`, product.stock_quantity])
+	);
+	const touchedProductIds = new Map<string, number>();
+	const statements: D1PreparedStatement[] = [];
+	const accepted: OfflineSyncAccepted[] = [];
+	const rejected: OfflineSyncRejected[] = [];
+
+	for (const sale of sales) {
+		const storeId = sale.storeId || DEFAULT_STORE_ID;
+		const store = storesById.get(storeId);
+
+		if (!store) {
+			rejected.push({
+				localId: sale.localId,
+				reason: 'invalid_sale',
+				message: 'Store not found for the offline sale.'
+			});
+			continue;
+		}
+
+		let aggregatedItems: SaleRequestItem[];
+
+		try {
+			aggregatedItems = aggregateItems(sale.items);
+		} catch (error) {
+			rejected.push({
+				localId: sale.localId,
+				reason: 'invalid_sale',
+				message: error instanceof Error ? error.message : 'The offline sale payload is invalid.'
+			});
+			continue;
+		}
+
+		if (aggregatedItems.length === 0) {
+			rejected.push({
+				localId: sale.localId,
+				reason: 'invalid_sale',
+				message: 'The offline sale does not contain any items.'
+			});
+			continue;
+		}
+
+		if (
+			!sale.userId ||
+			!Number.isInteger(sale.cashReceivedCents) ||
+			!Number.isInteger(sale.totalAmountCents) ||
+			sale.cashReceivedCents < sale.totalAmountCents
+		) {
+			rejected.push({
+				localId: sale.localId,
+				reason: 'invalid_sale',
+				message: 'The offline sale has invalid cash totals.'
+			});
+			continue;
+		}
+
+		const receiptItems: ReceiptItem[] = [];
+		let hasConflict = false;
+		let conflictMessage = 'Stock conflict detected during offline sync.';
+
+		for (const item of aggregatedItems) {
+			const product = productsById.get(`${storeId}:${item.productId}`);
+
+			if (!product || product.store_id !== storeId) {
+				hasConflict = true;
+				conflictMessage = 'One or more products no longer exist in this store.';
+				break;
+			}
+
+			const remainingStock =
+				virtualStock.get(`${storeId}:${item.productId}`) ?? product.stock_quantity;
+
+			if (remainingStock < item.quantity) {
+				hasConflict = true;
+				conflictMessage = `${product.name} only has ${remainingStock} unit(s) available for sync.`;
+				touchedProductIds.set(item.productId, remainingStock);
+				break;
+			}
+
+			receiptItems.push({
+				productId: product.id,
+				productName: product.name,
+				barcode: product.barcode,
+				quantity: item.quantity,
+				unitPriceCents: product.price_cents,
+				lineTotalCents: product.price_cents * item.quantity
+			});
+		}
+
+		if (hasConflict) {
+			rejected.push({
+				localId: sale.localId,
+				reason: 'stock_conflict',
+				message: conflictMessage
+			});
+			continue;
+		}
+
+		const calculatedTotal = receiptItems.reduce((total, item) => total + item.lineTotalCents, 0);
+
+		if (
+			calculatedTotal !== sale.subtotalCents ||
+			calculatedTotal !== sale.totalAmountCents ||
+			sale.changeDueCents !== sale.cashReceivedCents - sale.totalAmountCents
+		) {
+			rejected.push({
+				localId: sale.localId,
+				reason: 'invalid_sale',
+				message: 'The offline sale total no longer matches the product catalog.'
+			});
+			continue;
+		}
+
+		const transactionId = crypto.randomUUID();
+		const syncedAt = new Date().toISOString();
+
+		statements.push(
+			session
+				.prepare(
+				`INSERT INTO transactions (
+						id,
+						store_id,
+						user_id,
+						receipt_number,
+						status,
+						item_count,
+						subtotal_cents,
+						total_amount_cents,
+						cash_received_cents,
+						change_due_cents,
+						created_at
+					) VALUES (?, ?, ?, ?, 'completed', ?, ?, ?, ?, ?, ?)`
+				)
+				.bind(
+					transactionId,
+					storeId,
+					sale.userId,
+					sale.receiptNumber,
+					receiptItems.reduce((count, item) => count + item.quantity, 0),
+					calculatedTotal,
+					calculatedTotal,
+					sale.cashReceivedCents,
+					sale.changeDueCents,
+					sale.createdAt
+				)
+		);
+
+		for (const item of receiptItems) {
+			const stockKey = `${storeId}:${item.productId}`;
+			const nextStock = (virtualStock.get(stockKey) ?? 0) - item.quantity;
+			virtualStock.set(stockKey, nextStock);
+			touchedProductIds.set(item.productId, nextStock);
+
+			statements.push(
+				session
+					.prepare(
+						`UPDATE store_stock
+						SET stock_quantity = stock_quantity - ?, updated_at = ?
+						WHERE store_id = ? AND product_id = ?`
+					)
+					.bind(item.quantity, syncedAt, storeId, item.productId)
+			);
+
+			statements.push(
+				session
+					.prepare(
+						`INSERT INTO transaction_items (
+							id,
+							transaction_id,
+							product_id,
+							product_name_snapshot,
+							barcode_snapshot,
+							quantity,
+							unit_price_cents,
+							line_total_cents
+						) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+					)
+					.bind(
+						crypto.randomUUID(),
+						transactionId,
+						item.productId,
+						item.productName,
+						item.barcode,
+						item.quantity,
+						item.unitPriceCents,
+						item.lineTotalCents
+					)
+			);
+		}
+
+		accepted.push({
+			localId: sale.localId,
+			transactionId,
+			receiptNumber: sale.receiptNumber,
+			syncedAt
+		});
+	}
+
+	if (statements.length > 0) {
+		try {
+			await session.batch(statements);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : 'Failed to sync offline sales.';
+
+			if (message.includes('CHECK constraint failed')) {
+				throw new PosHttpError(409, 'Stock changed during offline sync. Retry after refreshing the catalog.');
+			}
+
+			throw new PosHttpError(500, message);
+		}
+	}
+
+	return {
+		accepted,
+		rejected,
+		updatedProducts: Array.from(touchedProductIds.entries()).map(([id, stockQuantity]) => ({
+			id,
+			stockQuantity
+		}))
+	};
+}
+
 export async function uploadProductImage(
 	env: PosBindings,
 	productId: string,
@@ -338,18 +642,20 @@ export async function uploadProductImage(
 
 	const product = await env.DB.prepare(
 		`SELECT
-			id,
-			store_id,
-			name,
-			barcode,
-			description,
-			price_cents,
-			stock_quantity,
-			image_key
-		FROM products
-		WHERE id = ?`
+			p.id,
+			ss.store_id,
+			p.name,
+			p.barcode,
+			p.description,
+			p.price_cents,
+			ss.stock_quantity,
+			ss.reorder_point,
+			p.image_key
+		FROM products p
+		INNER JOIN store_stock ss ON ss.product_id = p.id
+		WHERE p.id = ? AND ss.store_id = (SELECT store_id FROM products WHERE id = ?)`
 	)
-		.bind(productId)
+		.bind(productId, productId)
 		.first<ProductRow>();
 
 	if (!product) {
@@ -418,6 +724,31 @@ export function toApiError(error: unknown) {
 		};
 	}
 
+	if (
+		typeof error === 'object' &&
+		error !== null &&
+		'status' in error &&
+		typeof error.status === 'number'
+	) {
+		const message =
+			'body' in error &&
+			typeof error.body === 'object' &&
+			error.body !== null &&
+			'message' in error.body &&
+			typeof error.body.message === 'string'
+				? error.body.message
+				: error instanceof Error
+					? error.message
+					: 'Request failed.';
+
+		return {
+			status: error.status,
+			body: {
+				message
+			}
+		};
+	}
+
 	return {
 		status: 500,
 		body: {
@@ -452,6 +783,8 @@ function mapProductRow(row: ProductRow): ProductSummary {
 		description: row.description,
 		priceCents: row.price_cents,
 		stockQuantity: row.stock_quantity,
+		reorderPoint: row.reorder_point,
+		lowStock: row.stock_quantity <= row.reorder_point,
 		imageKey: row.image_key,
 		imageUrl: row.image_key ? `/api/product-images/${encodeKeyPath(row.image_key)}` : null
 	};

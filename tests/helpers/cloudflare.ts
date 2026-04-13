@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type {
@@ -10,6 +10,7 @@ import type {
 	R2ObjectBody
 } from '../../src/lib/server/cloudflare';
 import type { PosBindings } from '../../src/lib/server/env';
+import { authenticateUser, issueAuthToken } from '../../src/lib/server/auth';
 
 type QueryRow = Record<string, unknown>;
 type SQLValue = string | number | bigint | Uint8Array | null;
@@ -192,11 +193,23 @@ class TestR2Bucket {
 export async function createTestBindings() {
 	const sqlite = new DatabaseSync(':memory:');
 	sqlite.exec('PRAGMA foreign_keys = ON;');
-	sqlite.exec(await readFile(resolve('migrations/0001_online_pos_foundation.sql'), 'utf8'));
+	const migrationDirectory = resolve('migrations');
+	const migrationFiles = (await readdir(migrationDirectory))
+		.filter((filename) => filename.endsWith('.sql'))
+		.sort();
+
+	for (const migrationFile of migrationFiles) {
+		sqlite.exec(await readFile(resolve(migrationDirectory, migrationFile), 'utf8'));
+	}
 
 	const env: PosBindings = {
 		DB: new TestD1Database(sqlite) as unknown as D1Database,
-		PRODUCT_IMAGES: new TestR2Bucket() as unknown as R2Bucket
+		PRODUCT_IMAGES: new TestR2Bucket() as unknown as R2Bucket,
+		JWT_SECRET: 'test-jwt-secret',
+		EMAIL_TRANSPORT: 'mock',
+		LOW_STOCK_REPORT_FROM: 'alerts@retail-pos.example',
+		LOW_STOCK_REPORT_TO: 'ops@retail-pos.example',
+		RESEND_API_BASE_URL: 'https://api.resend.com'
 	};
 
 	return {
@@ -227,9 +240,12 @@ export function createRequestEvent(input: {
 	json?: unknown;
 	formData?: FormData;
 	params?: Record<string, string>;
-}) {
+	headers?: HeadersInit;
+	locals?: App.Locals;
+}): unknown {
 	let body: BodyInit | undefined;
-	const headers = new Headers();
+	const headers = new Headers(input.headers);
+	const cookieJar = new Map<string, string>();
 
 	if (input.formData) {
 		body = input.formData;
@@ -240,6 +256,16 @@ export function createRequestEvent(input: {
 
 	return {
 		platform: input.platform,
+		locals: input.locals ?? { user: null },
+		cookies: {
+			get: (name: string) => cookieJar.get(name),
+			set: (name: string, value: string) => {
+				cookieJar.set(name, value);
+			},
+			delete: (name: string) => {
+				cookieJar.delete(name);
+			}
+		},
 		request: new Request(input.url, {
 			method: input.method ?? 'GET',
 			headers,
@@ -247,11 +273,41 @@ export function createRequestEvent(input: {
 		}),
 		url: new URL(input.url),
 		params: input.params ?? {}
-	} as {
-		platform: App.Platform;
-		request: Request;
-		url: URL;
-		params: Record<string, string>;
+	};
+}
+
+export async function createAuthHeaders(
+	env: PosBindings,
+	email: string,
+	password: string
+) {
+	const user = await authenticateUser(env, email, password);
+
+	if (!user) {
+		throw new Error(`Unable to authenticate test user ${email}.`);
+	}
+
+	const token = await issueAuthToken(env, user);
+
+	return {
+		authorization: `Bearer ${token}`,
+		cookie: `pos_auth=${token}`
+	};
+}
+
+export async function createAuthLocals(
+	env: PosBindings,
+	email: string,
+	password: string
+): Promise<App.Locals> {
+	const user = await authenticateUser(env, email, password);
+
+	if (!user) {
+		throw new Error(`Unable to authenticate test user ${email}.`);
+	}
+
+	return {
+		user
 	};
 }
 
