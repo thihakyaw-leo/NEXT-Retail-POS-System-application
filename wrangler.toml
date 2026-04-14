@@ -25,7 +25,7 @@ head_sampling_rate = 1
 [[d1_databases]]
 binding = "DB"
 database_name = "retail-pos-enterprise"
-database_id = "00000000-0000-0000-0000-000000000001"
+database_id = "7091e204-839b-41c0-bdf2-e1d4211de02c"
 
 [[r2_buckets]]
 binding = "PRODUCT_IMAGES"
